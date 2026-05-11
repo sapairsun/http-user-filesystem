@@ -1,13 +1,15 @@
-# HTTP User FileSystem 协议定义
+# HTTP User FileSystem Protocol Definition
 
-## 总体约定
+[中文版本](./http-api-cn.md)
 
-- 基础前缀：`/v1`
-- 编码：请求和响应统一使用 `application/json; charset=utf-8`
-- 路径：所有路径均为以 `/` 开头的绝对路径
-- 时间：时间字段统一使用 Unix 秒时间戳
-- 二进制：文件读写内容统一使用十六进制字符串 `data_hex`
-- 成功响应：
+## General Rules
+
+- Base prefix: `/v1`
+- Encoding: both requests and responses use `application/json; charset=utf-8`
+- Paths: all paths are absolute and must start with `/`
+- Time: all time fields use Unix timestamps in seconds
+- Binary data: file contents are transferred as hexadecimal strings in `data_hex`
+- Success response:
 
 ```json
 {
@@ -15,7 +17,7 @@
 }
 ```
 
-- 失败响应：
+- Error response:
 
 ```json
 {
@@ -25,11 +27,11 @@
 }
 ```
 
-其中 `errno` 直接对应 POSIX `errno` 编号，客户端拿到后取负值返回给 FUSE。
+The `errno` field maps directly to POSIX `errno` values. The client returns the negative value back to FUSE.
 
-## 元数据对象
+## Metadata Object
 
-`meta` 用于表达文件或目录属性：
+`meta` describes a file or directory:
 
 ```json
 {
@@ -46,12 +48,12 @@
 }
 ```
 
-说明：
+Notes:
 
-- `type` 仅支持 `file` 与 `dir`
-- `mode` 为完整 `st_mode` 数值，已经包含文件类型位
+- `type` only supports `file` and `dir`
+- `mode` is the full `st_mode` value including file type bits
 
-## 目录项对象
+## Directory Entry Object
 
 ```json
 {
@@ -60,14 +62,14 @@
 }
 ```
 
-## 接口清单
+## API List
 
-### 1. 查询属性
+### 1. Query Metadata
 
-- 方法：`GET`
-- 路径：`/v1/meta?path=/target`
+- Method: `GET`
+- Path: `/v1/meta?path=/target`
 
-成功响应：
+Success response:
 
 ```json
 {
@@ -87,12 +89,12 @@
 }
 ```
 
-### 2. 列出目录
+### 2. List Directory
 
-- 方法：`GET`
-- 路径：`/v1/list?path=/dir`
+- Method: `GET`
+- Path: `/v1/list?path=/dir`
 
-成功响应：
+Success response:
 
 ```json
 {
@@ -114,12 +116,12 @@
 }
 ```
 
-### 3. 读取文件
+### 3. Read File
 
-- 方法：`GET`
-- 路径：`/v1/read?path=/file.txt&offset=0&size=4096`
+- Method: `GET`
+- Path: `/v1/read?path=/file.txt&offset=0&size=4096`
 
-成功响应：
+Success response:
 
 ```json
 {
@@ -129,12 +131,12 @@
 }
 ```
 
-### 4. 写入文件
+### 4. Write File
 
-- 方法：`POST`
-- 路径：`/v1/write`
+- Method: `POST`
+- Path: `/v1/write`
 
-请求体：
+Request body:
 
 ```json
 {
@@ -144,7 +146,7 @@
 }
 ```
 
-成功响应：
+Success response:
 
 ```json
 {
@@ -153,12 +155,12 @@
 }
 ```
 
-### 5. 创建文件
+### 5. Create File
 
-- 方法：`POST`
-- 路径：`/v1/create-file`
+- Method: `POST`
+- Path: `/v1/create-file`
 
-请求体：
+Request body:
 
 ```json
 {
@@ -167,12 +169,12 @@
 }
 ```
 
-### 6. 创建目录
+### 6. Create Directory
 
-- 方法：`POST`
-- 路径：`/v1/create-dir`
+- Method: `POST`
+- Path: `/v1/create-dir`
 
-请求体：
+Request body:
 
 ```json
 {
@@ -181,12 +183,12 @@
 }
 ```
 
-### 7. 删除文件
+### 7. Remove File
 
-- 方法：`POST`
-- 路径：`/v1/remove-file`
+- Method: `POST`
+- Path: `/v1/remove-file`
 
-请求体：
+Request body:
 
 ```json
 {
@@ -194,12 +196,12 @@
 }
 ```
 
-### 8. 删除目录
+### 8. Remove Directory
 
-- 方法：`POST`
-- 路径：`/v1/remove-dir`
+- Method: `POST`
+- Path: `/v1/remove-dir`
 
-请求体：
+Request body:
 
 ```json
 {
@@ -207,12 +209,12 @@
 }
 ```
 
-### 9. 重命名
+### 9. Rename
 
-- 方法：`POST`
-- 路径：`/v1/rename`
+- Method: `POST`
+- Path: `/v1/rename`
 
-请求体：
+Request body:
 
 ```json
 {
@@ -221,12 +223,12 @@
 }
 ```
 
-### 10. 截断文件
+### 10. Truncate File
 
-- 方法：`POST`
-- 路径：`/v1/truncate`
+- Method: `POST`
+- Path: `/v1/truncate`
 
-请求体：
+Request body:
 
 ```json
 {
@@ -235,12 +237,12 @@
 }
 ```
 
-### 11. 更新时间
+### 11. Update Timestamps
 
-- 方法：`POST`
-- 路径：`/v1/utimens`
+- Method: `POST`
+- Path: `/v1/utimens`
 
-请求体：
+Request body:
 
 ```json
 {
@@ -252,13 +254,13 @@
 }
 ```
 
-说明：
+Notes:
 
-- `atime_*` 表示访问时间
-- `mtime_*` 表示修改时间
-- `*_nsec` 支持普通纳秒值，也支持 `UTIME_NOW` 与 `UTIME_OMIT`
+- `atime_*` represents access time
+- `mtime_*` represents modification time
+- `*_nsec` supports both normal nanosecond values and the special values `UTIME_NOW` and `UTIME_OMIT`
 
-## FUSE 操作映射
+## FUSE Operation Mapping
 
 - `getattr` -> `GET /v1/meta`
 - `readdir` -> `GET /v1/list`
@@ -272,16 +274,16 @@
 - `truncate` -> `POST /v1/truncate`
 - `utimens` -> `POST /v1/utimens`
 
-## 示例流程
+## Example Flows
 
-### 创建并写入文件
+### Create And Write A File
 
-1. `POST /v1/create-file` 创建 `/hello.txt`
-2. `POST /v1/write` 写入 `hello\n`
-3. `GET /v1/meta?path=/hello.txt` 获取大小
-4. `GET /v1/read?path=/hello.txt&offset=0&size=4096` 读取内容
+1. `POST /v1/create-file` creates `/hello.txt`
+2. `POST /v1/write` writes `hello\n`
+3. `GET /v1/meta?path=/hello.txt` reads the file size
+4. `GET /v1/read?path=/hello.txt&offset=0&size=4096` reads the file content
 
-### 删除目录
+### Remove A Directory
 
-1. `GET /v1/list?path=/demo` 确认为空
-2. `POST /v1/remove-dir` 删除目录
+1. `GET /v1/list?path=/demo` confirms the directory is empty
+2. `POST /v1/remove-dir` removes the directory
