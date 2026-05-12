@@ -120,40 +120,47 @@ Success response:
 
 - Method: `GET`
 - Path: `/v1/read?path=/file.txt&offset=0&size=4096`
+- Success Content-Type: `application/octet-stream`
+- Success Header: `X-HTTPFS-Content-MD5: <md5>`
 
 Success response:
 
-```json
-{
-  "status": "ok",
-  "data_hex": "68656c6c6f0a",
-  "bytes_read": 6
-}
-```
+- The response body is the raw binary data read from the requested range
+
+Notes:
+
+- The client automatically splits large reads into multiple requests
+- The server computes sampled MD5 from bytes whose absolute file offsets are multiples of `10` (`0, 10, 20, 30, ...`) and returns it in `X-HTTPFS-Content-MD5`
+- The client must recompute the same sampled MD5 locally and fail the read if it does not match
+- Error responses remain JSON payloads with the existing `status/errno/message` structure
 
 ### 4. Write File
 
 - Method: `POST`
-- Path: `/v1/write`
+- Path: `/v1/write?path=/file.txt&offset=0`
+- Content-Type: `application/octet-stream`
+- Required Header: `X-HTTPFS-Content-MD5: <md5>`
 
 Request body:
 
-```json
-{
-  "path": "/file.txt",
-  "offset": 0,
-  "data_hex": "68656c6c6f0a"
-}
-```
+- Raw binary file content for the requested write range
 
 Success response:
 
 ```json
 {
   "status": "ok",
-  "bytes_written": 6
+  "bytes_written": 6,
+  "content_md5": "d41d8cd98f00b204e9800998ecf8427e"
 }
 ```
+
+Notes:
+
+- The client automatically splits large writes into multiple requests
+- The request body is raw bytes and is no longer wrapped in JSON or encoded as hex
+- The sampled MD5 is computed from bytes whose absolute file offsets are multiples of `10` (`0, 10, 20, 30, ...`)
+- The server must verify the request header MD5 against the uploaded chunk and verify the stored bytes again after writing; any mismatch must return an error
 
 ### 5. Create File
 

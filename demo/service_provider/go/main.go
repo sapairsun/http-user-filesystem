@@ -13,6 +13,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -61,7 +62,31 @@ type metaObject struct {
 const (
 	utimeNow  = int64((1 << 30) - 1)
 	utimeOmit = int64((1 << 30) - 2)
+	contentMD5Header = "X-HTTPFS-Content-MD5"
 )
+
+func computeSparseMD5Hex(data []byte, baseOffset int64) string {
+	sampled := make([]byte, 0, len(data)/10+1)
+	for index, value := range data {
+		if (baseOffset+int64(index))%10 == 0 {
+			sampled = append(sampled, value)
+		}
+	}
+	sum := md5.Sum(sampled)
+	return hex.EncodeToString(sum[:])
+}
+
+func validateContentMD5(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, ch := range value {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 func main() {
 	port := flag.Int("port", 0, "listen port")
@@ -208,53 +233,74 @@ func (s *server) handleRead(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	return writeJSON(w, map[string]any{
-		"status":     "ok",
-		"data_hex":   hex.EncodeToString(buffer[:bytesRead]),
-		"bytes_read": bytesRead,
-	})
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set(contentMD5Header, computeSparseMD5Hex(buffer[:bytesRead], offset))
+	_, err = w.Write(buffer[:bytesRead])
+	return err
 }
 
 func (s *server) handleWrite(w http.ResponseWriter, r *http.Request) error {
-	var req struct {
-		Path    string `json:"path"`
-		Offset  int64  `json:"offset"`
-		DataHex string `json:"data_hex"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return invalidArgument("invalid write body")
-	}
-	if req.Offset < 0 {
-		return invalidArgument("offset must be non-negative")
-	}
-
-	localPath, err := s.resolvePath(req.Path)
+	path := r.URL.Query().Get("path")
+	offset, err := parseNonNegativeInt64(r.URL.Query().Get("offset"), "offset")
 	if err != nil {
 		return err
 	}
-	data, err := hex.DecodeString(req.DataHex)
-	if err != nil {
-		return invalidArgument("invalid hex body")
+	if offset < 0 {
+		return invalidArgument("offset must be non-negative")
+	}
+	expectedMD5 := r.Header.Get(contentMD5Header)
+	if !validateContentMD5(expectedMD5) {
+		return invalidArgument("missing or invalid content md5")
 	}
 
-	file, err := os.OpenFile(localPath, os.O_WRONLY, 0)
+	localPath, err := s.resolvePath(path)
+	if err != nil {
+		return err
+	}
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	if computeSparseMD5Hex(data, offset) != expectedMD5 {
+		return errors.New("write content md5 verification failed")
+	}
+
+	file, err := os.OpenFile(localPath, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	if _, err = file.Seek(req.Offset, io.SeekStart); err != nil {
+	if _, err = file.Seek(offset, io.SeekStart); err != nil {
 		return err
 	}
 	bytesWritten, err := file.Write(data)
 	if err != nil {
 		return err
 	}
+	if int(bytesWritten) != len(data) {
+		return errors.New("short write")
+	}
+	if _, err = file.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	stored := make([]byte, len(data))
+	bytesRead, err := io.ReadFull(file, stored)
+	if err != nil {
+		return err
+	}
+	if bytesRead != len(data) {
+		return errors.New("stored content md5 verification failed")
+	}
+	actualMD5 := computeSparseMD5Hex(stored, offset)
+	if actualMD5 != expectedMD5 {
+		return errors.New("stored content md5 verification failed")
+	}
 
 	return writeJSON(w, map[string]any{
 		"status":        "ok",
 		"bytes_written": bytesWritten,
+		"content_md5":   actualMD5,
 	})
 }
 

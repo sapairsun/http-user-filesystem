@@ -28,8 +28,8 @@ HAS_FUSE := $(shell if [ -n "$(FUSE_PKG)" ]; then echo 1; else echo 0; fi)
 
 CPPFLAGS += $(LIBCURL_CFLAGS)
 
-COMMON_SRCS := src/json_utils.c src/http_client.c
-C_SERVICE_PROVIDER_SRCS := src/json_utils.c demo/service_provider/c/httpfs_server.c
+COMMON_SRCS := src/json_utils.c src/hash_utils.c src/http_client.c
+C_SERVICE_PROVIDER_SRCS := src/json_utils.c src/hash_utils.c demo/service_provider/c/httpfs_server.c
 PYTHON_PROVIDER_VENV := build/python-service_provider-venv
 ALL_TARGETS := build/test_json_utils build/httpfs_service_provider_c build/httpfs_service_provider_go build/test_http_client_integration
 ifeq ($(HAS_FUSE),1)
@@ -49,13 +49,13 @@ build:
 build/test_json_utils: tests/test_json_utils.c src/json_utils.c include/json_utils.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_json_utils.c src/json_utils.c -o $@ $(LDFLAGS)
 
-build/httpfs_service_provider_c: demo/service_provider/c/main.c $(C_SERVICE_PROVIDER_SRCS) include/httpfs_server.h include/json_utils.h | build
+build/httpfs_service_provider_c: demo/service_provider/c/main.c $(C_SERVICE_PROVIDER_SRCS) include/httpfs_server.h include/json_utils.h include/hash_utils.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) demo/service_provider/c/main.c $(C_SERVICE_PROVIDER_SRCS) -o $@ $(LDFLAGS)
 
 build/httpfs_service_provider_go: demo/service_provider/go/main.go demo/service_provider/go/go.mod | build
 	cd demo/service_provider/go && go build -o ../../../build/httpfs_service_provider_go .
 
-build/test_http_client_integration: tests/test_http_client_integration.c $(COMMON_SRCS) include/http_client.h include/httpfs_protocol.h include/json_utils.h third_party/jsmn.h | build
+build/test_http_client_integration: tests/test_http_client_integration.c $(COMMON_SRCS) include/http_client.h include/httpfs_protocol.h include/json_utils.h include/hash_utils.h third_party/jsmn.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_http_client_integration.c $(COMMON_SRCS) -o $@ $(LDFLAGS) $(LIBCURL_LIBS)
 
 $(PYTHON_PROVIDER_VENV)/bin/python: demo/service_provider/python/requirements.txt | build
@@ -65,7 +65,7 @@ $(PYTHON_PROVIDER_VENV)/bin/python: demo/service_provider/python/requirements.tx
 
 httpfs_mount: build/httpfs_mount
 
-build/httpfs_mount: src/httpfs_mount_main.c src/httpfs_fuse.c $(COMMON_SRCS) include/httpfs_fuse.h include/http_client.h include/httpfs_protocol.h include/json_utils.h third_party/jsmn.h | build
+build/httpfs_mount: src/httpfs_mount_main.c src/httpfs_fuse.c $(COMMON_SRCS) include/httpfs_fuse.h include/http_client.h include/httpfs_protocol.h include/json_utils.h include/hash_utils.h third_party/jsmn.h | build
 ifeq ($(HAS_FUSE),1)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FUSE_CFLAGS) src/httpfs_mount_main.c src/httpfs_fuse.c $(COMMON_SRCS) -o $@ $(LDFLAGS) $(LIBCURL_LIBS) $(FUSE_LIBS)
 else

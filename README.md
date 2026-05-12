@@ -2,12 +2,14 @@
 
 [中文版本](./README-CN.md)
 
-This project is an HTTP user-space file system example implemented in C. The user-space file system side talks to backend service providers over HTTP/JSON and maps common file operations to a remote directory. This is very useful when developing AI software.
+This project is an HTTP user-space file system example implemented in C. The user-space file system side talks to backend service providers over HTTP using JSON metadata APIs plus raw binary upload for file writes, and maps common file operations to a remote directory. This is very useful when developing AI software.
 
 ## Latest Features
 
 - Supports `getattr`, `readdir`, `read`, `write`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`, and `truncate`
 - Adds `utimens` support so `touch` and timestamp updates no longer fail with `Function not implemented`
+- Switches `write` to raw binary upload and `read` to raw binary download, with automatic client-side chunking for large files
+- Enforces runtime integrity verification for every upload and download chunk using sampled MD5 over bytes at absolute file offsets `0, 10, 20, 30, ...`
 - Provides three service provider implementations:
   - `demo/service_provider/c/`
   - `demo/service_provider/python/`
@@ -21,7 +23,7 @@ This project is an HTTP user-space file system example implemented in C. The use
 
 ## Directory Layout
 
-- `docs/http-api.md`: HTTP API and JSON protocol definition
+- `docs/http-api.md`: HTTP API and protocol definition
 - `include/`: shared header files
 - `src/http_client.c`: HTTP client and JSON parsing
 - `src/httpfs_fuse.c`: FUSE operation implementation

@@ -120,40 +120,47 @@
 
 - 方法：`GET`
 - 路径：`/v1/read?path=/file.txt&offset=0&size=4096`
+- 成功响应 Content-Type：`application/octet-stream`
+- 成功响应 Header：`X-HTTPFS-Content-MD5: <md5>`
 
 成功响应：
 
-```json
-{
-  "status": "ok",
-  "data_hex": "68656c6c6f0a",
-  "bytes_read": 6
-}
-```
+- 响应体直接返回请求区间内读取到的原始二进制数据
+
+说明：
+
+- 客户端会自动把大读取拆成多个分片请求
+- 服务端会按“绝对文件偏移为 `10` 的倍数”的字节位置（`0、10、20、30 ...`）采样并计算 MD5，通过 `X-HTTPFS-Content-MD5` 返回
+- 客户端必须用同样的采样规则重算 MD5；如果不一致，读取直接报错
+- 出错时仍然沿用现有 JSON 错误结构 `status/errno/message`
 
 ### 4. 写入文件
 
 - 方法：`POST`
-- 路径：`/v1/write`
+- 路径：`/v1/write?path=/file.txt&offset=0`
+- Content-Type：`application/octet-stream`
+- 必需 Header：`X-HTTPFS-Content-MD5: <md5>`
 
 请求体：
 
-```json
-{
-  "path": "/file.txt",
-  "offset": 0,
-  "data_hex": "68656c6c6f0a"
-}
-```
+- 直接上传目标写入范围对应的原始二进制数据
 
 成功响应：
 
 ```json
 {
   "status": "ok",
-  "bytes_written": 6
+  "bytes_written": 6,
+  "content_md5": "d41d8cd98f00b204e9800998ecf8427e"
 }
 ```
+
+说明：
+
+- 客户端会自动把大写入拆成多个分片请求
+- 请求体现在是原始字节流，不再使用 JSON 包装和十六进制编码
+- 采样 MD5 的算法是：只取绝对文件偏移为 `10` 的倍数的位置字节（`0、10、20、30 ...`）拼接后计算 MD5
+- 服务端必须先校验请求头里的 MD5 与上传数据是否一致，写入后还要再次从文件中读回并校验；任一步不一致都要报错
 
 ### 5. 创建文件
 

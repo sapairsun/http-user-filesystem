@@ -2,12 +2,14 @@
 
 [English Version](./README.md)
 
-这是一个基于 C 语言实现的 HTTP 用户态 文件系统示例项目。用户态文件系统 侧通过 HTTP/JSON 调用后端服务提供者，把常见文件操作映射到远端目录。这个在开发AI软件的时候非常有用。
+这是一个基于 C 语言实现的 HTTP 用户态 文件系统示例项目。用户态文件系统 侧通过 HTTP 调用后端服务提供者，元数据类接口使用 JSON，文件写入使用原始二进制上传，把常见文件操作映射到远端目录。这个在开发AI软件的时候非常有用。
 
 ## 最新功能
 
 - 支持 `getattr`、`readdir`、`read`、`write`、`create`、`mkdir`、`unlink`、`rmdir`、`rename`、`truncate`
 - 新增 `utimens` 支持，`touch`、更新时间戳等操作不再报 `Function not implemented`
+- `write` 已切换为原始二进制上传，`read` 已切换为原始二进制下载，并支持客户端自动分片处理大文件读写
+- 上传和下载每个分片都会在运行时强制做采样 MD5 校验：抽取绝对文件偏移 `0、10、20、30 ...` 的字节计算 MD5，不一致就直接报错
 - 支持三套服务提供者实现：
   - `demo/service_provider/c/`
   - `demo/service_provider/python/`
@@ -21,7 +23,7 @@
 
 ## 目录说明
 
-- `docs/http-api.md`：HTTP 接口与 JSON 协议定义
+- `docs/http-api.md`：HTTP 接口与协议定义
 - `include/`：公共头文件
 - `src/http_client.c`：HTTP 客户端与 JSON 解析
 - `src/httpfs_fuse.c`：FUSE 操作实现
@@ -300,4 +302,3 @@ umount -l /tmp/httpfs-mnt
 完整协议定义见：
 
 - `docs/http-api.md`
-

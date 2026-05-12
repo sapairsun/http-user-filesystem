@@ -30,15 +30,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "hash_utils.h"
 #include "json_utils.h"
 
-#define SERVER_BUFFER_SIZE 262144
+#define SERVER_LIST_PAYLOAD_SIZE 262144
+#define SERVER_INITIAL_REQUEST_BUFFER_SIZE 8192
+#define SERVER_MAX_REQUEST_SIZE (8U * 1024U * 1024U)
 #define SERVER_MAX_ENTRIES 4096
 #define SERVER_ACCEPT_BACKLOG 128
 #define SERVER_EPOLL_MAX_EVENTS 64
@@ -52,6 +56,7 @@ typedef struct {
     char method[8];
     char path[2048];
     char query[2048];
+    char content_md5[33];
     char *body;
     size_t body_length;
     const char *root_dir;
@@ -76,7 +81,8 @@ typedef struct connection_state {
     long content_length;
     size_t header_bytes;
     struct worker_context *worker;
-    char buffer[SERVER_BUFFER_SIZE];
+    char *buffer;
+    size_t capacity;
 } connection_state;
 
 typedef struct worker_context {
@@ -96,10 +102,11 @@ static void handle_signal(int signum) {
     g_stop_server = 1;
 }
 
-static void send_all(int fd, const char *data, size_t length) {
+static void send_all(int fd, const void *data, size_t length) {
     size_t sent = 0;
+    const char *bytes = (const char *) data;
     while (sent < length) {
-        ssize_t written = send(fd, data + sent, length - sent, 0);
+        ssize_t written = send(fd, bytes + sent, length - sent, 0);
         if (written <= 0) {
             return;
         }
@@ -124,6 +131,132 @@ static void send_json(int fd, int status_code, const char *body) {
 
 static void send_ok(int fd, const char *payload) {
     send_json(fd, 200, payload);
+}
+
+static void send_binary(int fd, const void *body, size_t body_length, const char *content_md5) {
+    char header[256];
+    int header_length = snprintf(header, sizeof(header),
+                                 "HTTP/1.1 200 OK\r\n"
+                                 "Content-Type: application/octet-stream\r\n"
+                                 "X-HTTPFS-Content-MD5: %s\r\n"
+                                 "Content-Length: %zu\r\n"
+                                 "Connection: close\r\n\r\n",
+                                 content_md5 != NULL ? content_md5 : "", body_length);
+    if (header_length > 0) {
+        send_all(fd, header, (size_t) header_length);
+    }
+    if (body_length > 0) {
+        send_all(fd, body, body_length);
+    }
+}
+
+static int extract_header_value(const char *headers_start, const char *headers_end, const char *header_name, char *output,
+                                size_t output_size) {
+    size_t header_name_length = strlen(header_name);
+    const char *cursor = headers_start;
+
+    if (output == NULL || output_size == 0U) {
+        return -1;
+    }
+    output[0] = '\0';
+
+    while (cursor < headers_end) {
+        const char *line_end = strstr(cursor, "\r\n");
+        const char *value_start;
+        size_t value_length;
+        if (line_end == NULL || line_end > headers_end) {
+            break;
+        }
+        if ((size_t) (line_end - cursor) > header_name_length &&
+            strncasecmp(cursor, header_name, header_name_length) == 0 && cursor[header_name_length] == ':') {
+            value_start = cursor + header_name_length + 1;
+            while (value_start < line_end && (*value_start == ' ' || *value_start == '\t')) {
+                value_start++;
+            }
+            value_length = (size_t) (line_end - value_start);
+            if (value_length + 1U > output_size) {
+                return -1;
+            }
+            memcpy(output, value_start, value_length);
+            output[value_length] = '\0';
+            return 0;
+        }
+        cursor = line_end + 2;
+    }
+    return -1;
+}
+
+static ssize_t pwrite_full(int fd, const unsigned char *buffer, size_t length, off_t offset) {
+    size_t total_written = 0;
+
+    while (total_written < length) {
+        ssize_t written = pwrite(fd, buffer + total_written, length - total_written, offset + (off_t) total_written);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (written == 0) {
+            break;
+        }
+        total_written += (size_t) written;
+    }
+
+    return (ssize_t) total_written;
+}
+
+static ssize_t pread_full(int fd, unsigned char *buffer, size_t length, off_t offset) {
+    size_t total_read = 0;
+
+    while (total_read < length) {
+        ssize_t bytes_read = pread(fd, buffer + total_read, length - total_read, offset + (off_t) total_read);
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+        total_read += (size_t) bytes_read;
+    }
+
+    return (ssize_t) total_read;
+}
+
+static int ensure_connection_capacity(connection_state *conn, size_t required_size) {
+    char *new_buffer;
+    size_t new_capacity;
+
+    if (required_size <= conn->capacity) {
+        return 0;
+    }
+    if (required_size > SERVER_MAX_REQUEST_SIZE) {
+        return -1;
+    }
+
+    new_capacity = conn->capacity > 0 ? conn->capacity : SERVER_INITIAL_REQUEST_BUFFER_SIZE;
+    while (new_capacity < required_size) {
+        if (new_capacity >= SERVER_MAX_REQUEST_SIZE / 2U) {
+            new_capacity = SERVER_MAX_REQUEST_SIZE;
+            break;
+        }
+        new_capacity *= 2U;
+    }
+    if (new_capacity < required_size || new_capacity > SERVER_MAX_REQUEST_SIZE) {
+        return -1;
+    }
+
+    new_buffer = realloc(conn->buffer, new_capacity);
+    if (new_buffer == NULL) {
+        return -1;
+    }
+
+    conn->buffer = new_buffer;
+    conn->capacity = new_capacity;
+    return 0;
 }
 
 static void send_error_json(int fd, long errno_value, const char *message) {
@@ -352,7 +485,7 @@ static void handle_list(request_context *ctx) {
     DIR *dir;
     struct dirent *entry;
     struct stat st;
-    char payload[SERVER_BUFFER_SIZE];
+    char payload[SERVER_LIST_PAYLOAD_SIZE];
     size_t pos = 0;
     int first = 1;
 
@@ -413,8 +546,7 @@ static void handle_read(request_context *ctx) {
     int fd;
     unsigned char *buffer;
     ssize_t bytes_read;
-    char *data_hex;
-    char *payload;
+    char content_md5[33];
 
     if (query_value(ctx->query, "path", path, sizeof(path)) == NULL ||
         query_value(ctx->query, "offset", offset_text, sizeof(offset_text)) == NULL ||
@@ -426,7 +558,7 @@ static void handle_read(request_context *ctx) {
 
     offset = strtoll(offset_text, NULL, 10);
     size = strtoll(size_text, NULL, 10);
-    if (offset < 0 || size < 0 || size > 65536) {
+    if (offset < 0 || size < 0) {
         send_error_json(ctx->fd, EINVAL, "invalid offset or size");
         return;
     }
@@ -438,13 +570,9 @@ static void handle_read(request_context *ctx) {
     }
 
     buffer = malloc((size_t) size + 1);
-    data_hex = malloc((size_t) size * 2 + 1);
-    payload = malloc((size_t) size * 2 + 128);
-    if (buffer == NULL || data_hex == NULL || payload == NULL) {
+    if (buffer == NULL) {
         close(fd);
         free(buffer);
-        free(data_hex);
-        free(payload);
         send_error_json(ctx->fd, ENOMEM, "memory allocation failed");
         return;
     }
@@ -453,88 +581,99 @@ static void handle_read(request_context *ctx) {
     close(fd);
     if (bytes_read < 0) {
         free(buffer);
-        free(data_hex);
-        free(payload);
         send_error_json(ctx->fd, errno, strerror(errno));
         return;
     }
 
-    if (hex_encode(buffer, (size_t) bytes_read, data_hex, (size_t) size * 2 + 1) != 0) {
+    if (httpfs_sparse_md5_hex(buffer, (size_t) bytes_read, (off_t) offset, content_md5) != 0) {
         free(buffer);
-        free(data_hex);
-        free(payload);
-        send_error_json(ctx->fd, EIO, "hex encode failed");
+        send_error_json(ctx->fd, EIO, "failed to compute read content md5");
         return;
     }
 
-    snprintf(payload, (size_t) size * 2 + 128, "{\"status\":\"ok\",\"data_hex\":\"%s\",\"bytes_read\":%lld}", data_hex,
-             (long long) bytes_read);
-    send_ok(ctx->fd, payload);
-
+    send_binary(ctx->fd, buffer, (size_t) bytes_read, content_md5);
     free(buffer);
-    free(data_hex);
-    free(payload);
 }
 
 static void handle_write(request_context *ctx) {
     char path[2048];
     char local_path[4096];
-    char *data_hex = NULL;
+    char offset_text[64];
     long long offset = 0;
-    unsigned char *decoded = NULL;
-    size_t decoded_len = 0;
     int fd;
+    unsigned char *verify_buffer = NULL;
     ssize_t written;
+    ssize_t verified;
+    char expected_md5[33];
+    char actual_md5[33];
     char payload[256];
 
-    data_hex = malloc(ctx->body_length + 1);
-    if (data_hex == NULL) {
-        send_error_json(ctx->fd, ENOMEM, "memory allocation failed");
-        return;
-    }
-
-    if (json_get_string(ctx->body, "path", path, sizeof(path)) != 0 ||
-        json_get_long(ctx->body, "offset", &offset) != 0 ||
-        json_get_string(ctx->body, "data_hex", data_hex, ctx->body_length + 1) != 0 ||
+    if (query_value(ctx->query, "path", path, sizeof(path)) == NULL ||
+        query_value(ctx->query, "offset", offset_text, sizeof(offset_text)) == NULL ||
         resolve_path(ctx->root_dir, path, local_path, sizeof(local_path)) != 0) {
-        free(data_hex);
         send_error_json(ctx->fd, EINVAL, "invalid write body");
         return;
     }
+    offset = strtoll(offset_text, NULL, 10);
+    if (offset < 0) {
+        send_error_json(ctx->fd, EINVAL, "invalid write offset");
+        return;
+    }
+    if (!httpfs_is_valid_md5_hex(ctx->content_md5)) {
+        send_error_json(ctx->fd, EINVAL, "missing or invalid content md5");
+        return;
+    }
+    if (httpfs_sparse_md5_hex((const unsigned char *) ctx->body, ctx->body_length, (off_t) offset, expected_md5) != 0) {
+        send_error_json(ctx->fd, EIO, "failed to compute write content md5");
+        return;
+    }
+    if (strcmp(expected_md5, ctx->content_md5) != 0) {
+        send_error_json(ctx->fd, EIO, "write content md5 verification failed");
+        return;
+    }
 
-    decoded = malloc(strlen(data_hex) / 2 + 1);
-    if (decoded == NULL) {
-        free(data_hex);
+    fd = open(local_path, O_RDWR);
+    if (fd < 0) {
+        send_error_json(ctx->fd, errno, strerror(errno));
+        return;
+    }
+
+    written = pwrite_full(fd, (const unsigned char *) ctx->body, ctx->body_length, (off_t) offset);
+    if (written < 0) {
+        close(fd);
+        send_error_json(ctx->fd, errno, strerror(errno));
+        return;
+    }
+    if ((size_t) written != ctx->body_length) {
+        close(fd);
+        send_error_json(ctx->fd, EIO, "short write");
+        return;
+    }
+
+    verify_buffer = malloc(ctx->body_length > 0 ? ctx->body_length : 1U);
+    if (verify_buffer == NULL) {
+        close(fd);
         send_error_json(ctx->fd, ENOMEM, "memory allocation failed");
         return;
     }
-
-    if (hex_decode(data_hex, decoded, strlen(data_hex) / 2 + 1, &decoded_len) != 0) {
-        free(data_hex);
-        free(decoded);
-        send_error_json(ctx->fd, EINVAL, "invalid hex body");
-        return;
-    }
-
-    fd = open(local_path, O_WRONLY);
-    if (fd < 0) {
-        free(data_hex);
-        free(decoded);
-        send_error_json(ctx->fd, errno, strerror(errno));
-        return;
-    }
-
-    written = pwrite(fd, decoded, decoded_len, (off_t) offset);
+    verified = pread_full(fd, verify_buffer, ctx->body_length, (off_t) offset);
     close(fd);
-    free(data_hex);
-    free(decoded);
-
-    if (written < 0) {
+    if (verified < 0) {
+        free(verify_buffer);
         send_error_json(ctx->fd, errno, strerror(errno));
         return;
     }
+    if ((size_t) verified != ctx->body_length ||
+        httpfs_sparse_md5_hex(verify_buffer, (size_t) verified, (off_t) offset, actual_md5) != 0 ||
+        strcmp(actual_md5, expected_md5) != 0) {
+        free(verify_buffer);
+        send_error_json(ctx->fd, EIO, "stored content md5 verification failed");
+        return;
+    }
+    free(verify_buffer);
 
-    snprintf(payload, sizeof(payload), "{\"status\":\"ok\",\"bytes_written\":%lld}", (long long) written);
+    snprintf(payload, sizeof(payload), "{\"status\":\"ok\",\"bytes_written\":%lld,\"content_md5\":\"%s\"}", (long long) written,
+             actual_md5);
     send_ok(ctx->fd, payload);
 }
 
@@ -761,6 +900,7 @@ static void process_request_buffer(int client_fd, const char *root_dir, char *bu
     char *content_length_header;
     long content_length = 0;
     request_context ctx;
+    const char *headers_start;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.fd = client_fd;
@@ -784,9 +924,13 @@ static void process_request_buffer(int client_fd, const char *root_dir, char *bu
         return;
     }
 
+    headers_start = line_end + 2;
     content_length_header = strstr(line_end + 2, "Content-Length:");
     if (content_length_header != NULL) {
         content_length = strtol(content_length_header + strlen("Content-Length:"), NULL, 10);
+    }
+    if (extract_header_value(headers_start, header_end, "X-HTTPFS-Content-MD5", ctx.content_md5, sizeof(ctx.content_md5)) != 0) {
+        ctx.content_md5[0] = '\0';
     }
 
     ctx.body = header_end + 4;
@@ -870,6 +1014,7 @@ static void close_connection(connection_state *conn) {
     }
     epoll_ctl(conn->worker->epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
     close(conn->fd);
+    free(conn->buffer);
     free(conn);
 }
 
@@ -895,6 +1040,10 @@ static int add_client_to_worker(worker_context *worker, int client_fd) {
     conn->fd = client_fd;
     conn->content_length = -1;
     conn->worker = worker;
+    if (ensure_connection_capacity(conn, SERVER_INITIAL_REQUEST_BUFFER_SIZE) != 0) {
+        free(conn);
+        return -1;
+    }
 
     memset(&event, 0, sizeof(event));
     event.events = EPOLLIN | EPOLLRDHUP;
@@ -942,8 +1091,11 @@ static int connection_has_complete_request(connection_state *conn) {
     }
 
     total_required = conn->header_bytes + (size_t) conn->content_length;
-    if (total_required >= sizeof(conn->buffer)) {
-        return -1;
+    if (total_required + 1U > SERVER_MAX_REQUEST_SIZE) {
+        return -2;
+    }
+    if (ensure_connection_capacity(conn, total_required + 1U) != 0) {
+        return -2;
     }
     return conn->received >= total_required ? 1 : 0;
 }
@@ -962,13 +1114,19 @@ static void handle_client_event(connection_state *conn, uint32_t events) {
             return;
         }
 
-        if (conn->received + 1 >= sizeof(conn->buffer)) {
-            send_error_json(conn->fd, ENOBUFS, "request too large");
-            close_connection(conn);
-            return;
+        if (conn->capacity - conn->received <= 1U) {
+            size_t next_capacity = conn->capacity > 0 ? conn->capacity * 2U : SERVER_INITIAL_REQUEST_BUFFER_SIZE;
+            if (next_capacity > SERVER_MAX_REQUEST_SIZE) {
+                next_capacity = SERVER_MAX_REQUEST_SIZE;
+            }
+            if (ensure_connection_capacity(conn, next_capacity) != 0) {
+                send_error_json(conn->fd, ENOBUFS, "request too large");
+                close_connection(conn);
+                return;
+            }
         }
 
-        bytes_read = recv(conn->fd, conn->buffer + conn->received, sizeof(conn->buffer) - conn->received - 1, 0);
+        bytes_read = recv(conn->fd, conn->buffer + conn->received, conn->capacity - conn->received - 1U, 0);
         if (bytes_read == 0) {
             close_connection(conn);
             return;
@@ -987,7 +1145,11 @@ static void handle_client_event(connection_state *conn, uint32_t events) {
         conn->received += (size_t) bytes_read;
         state = connection_has_complete_request(conn);
         if (state < 0) {
-            send_error_json(conn->fd, EINVAL, "invalid http request");
+            if (state == -2) {
+                send_error_json(conn->fd, ENOBUFS, "request too large");
+            } else {
+                send_error_json(conn->fd, EINVAL, "invalid http request");
+            }
             close_connection(conn);
             return;
         }

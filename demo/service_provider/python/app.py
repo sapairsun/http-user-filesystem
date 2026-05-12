@@ -14,12 +14,13 @@
 import argparse
 import binascii
 import errno
+import hashlib
 import os
 import stat
 import time
 from typing import Any, Dict, List
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
@@ -27,6 +28,7 @@ app = Flask(__name__)
 ROOT_DIR = ""
 UTIME_NOW = getattr(os, "UTIME_NOW", 1073741823)
 UTIME_OMIT = getattr(os, "UTIME_OMIT", 1073741822)
+CONTENT_MD5_HEADER = "X-HTTPFS-Content-MD5"
 
 
 def error_response(errno_value: int, message: str):
@@ -86,6 +88,18 @@ def decode_hex(data_hex: str) -> bytes:
         return binascii.unhexlify(data_hex.encode("ascii"))
     except (binascii.Error, ValueError) as exc:
         raise OSError(errno.EINVAL, f"invalid hex payload: {exc}") from exc
+
+
+def compute_sparse_md5_hex(data: bytes, base_offset: int) -> str:
+    sampled = bytearray()
+    for index, value in enumerate(data):
+        if (base_offset + index) % 10 == 0:
+            sampled.append(value)
+    return hashlib.md5(sampled).hexdigest()
+
+
+def validate_content_md5(value: str) -> bool:
+    return len(value) == 32 and all(ch in "0123456789abcdef" for ch in value)
 
 
 def normalize_utimens_value(current_ns: int, sec: int, nsec: int) -> int:
@@ -153,28 +167,40 @@ def read_file():
         handle.seek(offset)
         data = handle.read(size)
 
-    return ok_response({
-        "data_hex": binascii.hexlify(data).decode("ascii"),
-        "bytes_read": len(data),
-    })
+    response = Response(data, mimetype="application/octet-stream")
+    response.headers[CONTENT_MD5_HEADER] = compute_sparse_md5_hex(data, offset)
+    return response
 
 
 @app.post("/v1/write")
 def write_file():
-    payload = request.get_json(force=True, silent=False)
-    path = payload["path"]
-    offset = int(payload["offset"])
-    data = decode_hex(payload["data_hex"])
+    path = request.args.get("path", "")
+    offset = int(request.args.get("offset", "0"))
+    data = request.get_data(cache=False, as_text=False)
+    expected_md5 = request.headers.get(CONTENT_MD5_HEADER, "")
     local_path = resolve_path(path)
 
     if offset < 0:
         raise OSError(errno.EINVAL, "offset must be non-negative")
+    if not validate_content_md5(expected_md5):
+        raise OSError(errno.EINVAL, "missing or invalid content md5")
+    if compute_sparse_md5_hex(data, offset) != expected_md5:
+        raise OSError(errno.EIO, "write content md5 verification failed")
 
     with open(local_path, "r+b") as handle:
         handle.seek(offset)
         written = handle.write(data)
+        handle.flush()
+        handle.seek(offset)
+        stored = handle.read(len(data))
 
-    return ok_response({"bytes_written": written})
+    if written != len(data):
+        raise OSError(errno.EIO, "short write")
+    actual_md5 = compute_sparse_md5_hex(stored, offset)
+    if actual_md5 != expected_md5:
+        raise OSError(errno.EIO, "stored content md5 verification failed")
+
+    return ok_response({"bytes_written": written, "content_md5": actual_md5})
 
 
 @app.post("/v1/create-file")

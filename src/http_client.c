@@ -19,14 +19,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
+#include "hash_utils.h"
 #include "json_utils.h"
 #include "../third_party/jsmn.h"
+
+#define HTTPFS_READ_CHUNK_SIZE (1024U * 1024U)
+#define HTTPFS_WRITE_CHUNK_SIZE (1024U * 1024U)
+#define HTTPFS_CONTENT_MD5_HEADER "X-HTTPFS-Content-MD5"
 
 typedef struct {
     char *data;
     size_t length;
 } response_buffer;
+
+typedef struct {
+    char content_type[128];
+    char content_md5[33];
+} response_metadata;
 
 static void normalize_base_url(char *output, size_t output_size, const char *base_url) {
     size_t length = 0;
@@ -84,6 +95,65 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     memcpy(buffer->data + buffer->length, contents, total_size);
     buffer->length += total_size;
     buffer->data[buffer->length] = '\0';
+    return total_size;
+}
+
+static size_t header_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t total_size = size * nmemb;
+    response_metadata *metadata = (response_metadata *) userp;
+    const char *header = (const char *) contents;
+    const char *value_start;
+    const char *value_end;
+    size_t value_length;
+
+    if (metadata == NULL) {
+        return total_size;
+    }
+    if (total_size > strlen("Content-Type:") &&
+        strncasecmp(header, "Content-Type:", strlen("Content-Type:")) == 0) {
+        value_start = header + strlen("Content-Type:");
+        while (*value_start == ' ' || *value_start == '\t') {
+            value_start++;
+        }
+
+        value_end = header + total_size;
+        while (value_end > value_start && (value_end[-1] == '\r' || value_end[-1] == '\n' || value_end[-1] == ' ' ||
+                                           value_end[-1] == '\t')) {
+            value_end--;
+        }
+
+        value_length = (size_t) (value_end - value_start);
+        if (value_length >= sizeof(metadata->content_type)) {
+            value_length = sizeof(metadata->content_type) - 1;
+        }
+
+        memcpy(metadata->content_type, value_start, value_length);
+        metadata->content_type[value_length] = '\0';
+        return total_size;
+    }
+    if (total_size <= strlen(HTTPFS_CONTENT_MD5_HEADER ":") ||
+        strncasecmp(header, HTTPFS_CONTENT_MD5_HEADER ":", strlen(HTTPFS_CONTENT_MD5_HEADER ":")) != 0) {
+        return total_size;
+    }
+
+    value_start = header + strlen(HTTPFS_CONTENT_MD5_HEADER ":");
+    while (*value_start == ' ' || *value_start == '\t') {
+        value_start++;
+    }
+
+    value_end = header + total_size;
+    while (value_end > value_start && (value_end[-1] == '\r' || value_end[-1] == '\n' || value_end[-1] == ' ' ||
+                                       value_end[-1] == '\t')) {
+        value_end--;
+    }
+
+    value_length = (size_t) (value_end - value_start);
+    if (value_length >= sizeof(metadata->content_md5)) {
+        value_length = sizeof(metadata->content_md5) - 1;
+    }
+
+    memcpy(metadata->content_md5, value_start, value_length);
+    metadata->content_md5[value_length] = '\0';
     return total_size;
 }
 
@@ -209,12 +279,32 @@ static int parse_status_or_error(const char *json, jsmntok_t *tokens, int token_
     return -1;
 }
 
-static int http_request(httpfs_client *client, const char *method, const char *endpoint, const char *body,
-                        long *status_code, char **response_out, httpfs_error *error) {
+static int is_content_type_json(const char *content_type) {
+    return content_type != NULL && strncasecmp(content_type, "application/json", strlen("application/json")) == 0;
+}
+
+static int is_content_type_octet_stream(const char *content_type) {
+    return content_type != NULL &&
+           strncasecmp(content_type, "application/octet-stream", strlen("application/octet-stream")) == 0;
+}
+
+static int parse_error_response(const char *json, httpfs_error *error) {
+    jsmntok_t tokens[256];
+    int token_count = parse_response_tokens(json, tokens, (int) (sizeof(tokens) / sizeof(tokens[0])), error);
+    if (token_count < 0) {
+        return -1;
+    }
+    return parse_status_or_error(json, tokens, token_count, error);
+}
+
+static int http_request_ex(httpfs_client *client, const char *method, const char *endpoint, const void *body, size_t body_size,
+                           const char *content_type, const char *content_md5, long *status_code, char **response_out,
+                           size_t *response_size_out, response_metadata *metadata_out, httpfs_error *error) {
     CURL *curl = NULL;
     CURLcode curl_result;
     struct curl_slist *headers = NULL;
     response_buffer response = {0};
+    response_metadata metadata = {0};
     char url[1024];
 
     if (snprintf(url, sizeof(url), "%s%s", client->base_url, endpoint) >= (int) sizeof(url)) {
@@ -232,15 +322,39 @@ static int http_request(httpfs_client *client, const char *method, const char *e
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, client->timeout_ms);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &metadata);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, client->verbose ? 1L : 0L);
 
     if (strcmp(method, "POST") == 0) {
-        headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
+        if (content_type != NULL) {
+            char content_type_header[128];
+            if (snprintf(content_type_header, sizeof(content_type_header), "Content-Type: %s", content_type) >=
+                (int) sizeof(content_type_header)) {
+                set_error(error, EINVAL, "Content-Type header is too long");
+                curl_easy_cleanup(curl);
+                return -1;
+            }
+            headers = curl_slist_append(headers, content_type_header);
+        }
+        if (content_md5 != NULL) {
+            char md5_header[128];
+            if (snprintf(md5_header, sizeof(md5_header), HTTPFS_CONTENT_MD5_HEADER ": %s", content_md5) >=
+                (int) sizeof(md5_header)) {
+                set_error(error, EINVAL, "Content MD5 header is too long");
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+                return -1;
+            }
+            headers = curl_slist_append(headers, md5_header);
+        }
+        headers = curl_slist_append(headers, "Expect:");
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body != NULL ? body : "");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) body_size);
     }
 
     curl_result = curl_easy_perform(curl);
@@ -266,7 +380,21 @@ static int http_request(httpfs_client *client, const char *method, const char *e
     }
 
     *response_out = response.data;
+    if (response_size_out != NULL) {
+        *response_size_out = response.length;
+    }
+    if (metadata_out != NULL) {
+        *metadata_out = metadata;
+    }
     return 0;
+}
+
+static int http_request(httpfs_client *client, const char *method, const char *endpoint, const void *body, size_t body_size,
+                        const char *content_type, const char *content_md5, long *status_code, char **response_out,
+                        httpfs_error *error) {
+    return http_request_ex(client, method, endpoint, body, body_size, content_type, content_md5, status_code, response_out,
+                           NULL, NULL,
+                           error);
 }
 
 static int build_read_endpoint(const char *path, off_t offset, size_t size, char *endpoint, size_t endpoint_size) {
@@ -287,6 +415,27 @@ static int build_read_endpoint(const char *path, off_t offset, size_t size, char
     written = snprintf(endpoint, endpoint_size, "/v1/read?path=%s&offset=%lld&size=%zu", escaped_path,
                        (long long) offset, size);
 
+    curl_free(escaped_path);
+    curl_easy_cleanup(curl);
+    return (written >= 0 && (size_t) written < endpoint_size) ? 0 : -1;
+}
+
+static int build_write_endpoint(const char *path, off_t offset, char *endpoint, size_t endpoint_size) {
+    CURL *curl = curl_easy_init();
+    char *escaped_path;
+    int written;
+
+    if (curl == NULL) {
+        return -1;
+    }
+
+    escaped_path = curl_easy_escape(curl, path, 0);
+    if (escaped_path == NULL) {
+        curl_easy_cleanup(curl);
+        return -1;
+    }
+
+    written = snprintf(endpoint, endpoint_size, "/v1/write?path=%s&offset=%lld", escaped_path, (long long) offset);
     curl_free(escaped_path);
     curl_easy_cleanup(curl);
     return (written >= 0 && (size_t) written < endpoint_size) ? 0 : -1;
@@ -420,7 +569,7 @@ int httpfs_get_meta(httpfs_client *client, const char *path, httpfs_meta *meta, 
         return -1;
     }
 
-    if (http_request(client, "GET", endpoint, NULL, &status_code, &response, error) != 0) {
+    if (http_request(client, "GET", endpoint, NULL, 0, NULL, NULL, &status_code, &response, error) != 0) {
         return -1;
     }
 
@@ -464,7 +613,7 @@ int httpfs_list_dir(httpfs_client *client, const char *path, httpfs_dir_entry *e
         return -1;
     }
 
-    if (http_request(client, "GET", endpoint, NULL, &status_code, &response, error) != 0) {
+    if (http_request(client, "GET", endpoint, NULL, 0, NULL, NULL, &status_code, &response, error) != 0) {
         return -1;
     }
 
@@ -524,58 +673,87 @@ int httpfs_read_file(httpfs_client *client, const char *path, off_t offset, size
                      size_t *bytes_read, httpfs_error *error) {
     char endpoint[1024];
     char *response = NULL;
+    size_t response_size = 0;
     long status_code = 0;
-    jsmntok_t tokens[512];
-    int token_count;
-    int data_index;
-    int bytes_read_index;
-    char data_hex[131072];
-    long server_bytes_read = 0;
-    size_t decoded_len = 0;
+    response_metadata metadata = {0};
+    size_t total_read = 0;
     int result = -1;
 
-    if (size * 2 + 1 > sizeof(data_hex)) {
-        set_error(error, ENOBUFS, "Read size exceeds the current implementation limit");
-        return -1;
+    if (bytes_read != NULL) {
+        *bytes_read = 0;
+    }
+    if (size == 0U) {
+        return 0;
     }
 
-    if (build_read_endpoint(path, offset, size, endpoint, sizeof(endpoint)) != 0) {
-        set_error(error, ENAMETOOLONG, "Failed to build read request");
-        return -1;
+    while (total_read < size) {
+        size_t chunk_size = size - total_read;
+        if (chunk_size > HTTPFS_READ_CHUNK_SIZE) {
+            chunk_size = HTTPFS_READ_CHUNK_SIZE;
+        }
+        free(response);
+        response = NULL;
+        response_size = 0;
+        metadata.content_type[0] = '\0';
+
+        if (build_read_endpoint(path, offset + (off_t) total_read, chunk_size, endpoint, sizeof(endpoint)) != 0) {
+            set_error(error, ENAMETOOLONG, "Failed to build read request");
+            goto out;
+        }
+
+        char expected_md5[33];
+
+        if (http_request_ex(client, "GET", endpoint, NULL, 0, NULL, NULL, &status_code, &response, &response_size, &metadata,
+                            error) != 0) {
+            goto out;
+        }
+
+        if (status_code != 200) {
+            set_error(error, EIO, "Read request returned a non-200 status");
+            goto out;
+        }
+
+        if (is_content_type_json(metadata.content_type)) {
+            if (parse_error_response(response, error) != 0) {
+                goto out;
+            }
+            set_error(error, EIO, "Read request returned an unexpected JSON success response");
+            goto out;
+        }
+        if (!is_content_type_octet_stream(metadata.content_type)) {
+            set_error(error, EIO, "Read response returned an unexpected Content-Type");
+            goto out;
+        }
+        if (!httpfs_is_valid_md5_hex(metadata.content_md5)) {
+            set_error(error, EIO, "Read response is missing a valid content MD5");
+            goto out;
+        }
+        if (response_size > chunk_size) {
+            set_error(error, EIO, "Read response exceeded the requested chunk size");
+            goto out;
+        }
+        if (httpfs_sparse_md5_hex((const unsigned char *) response, response_size, offset + (off_t) total_read, expected_md5) !=
+            0) {
+            set_error(error, EIO, "Failed to compute read content MD5");
+            goto out;
+        }
+        if (strcmp(expected_md5, metadata.content_md5) != 0) {
+            set_error(error, EIO, "Read content MD5 verification failed");
+            goto out;
+        }
+
+        if (response_size > 0) {
+            memcpy(buffer + total_read, response, response_size);
+        }
+        total_read += response_size;
+        if (response_size < chunk_size) {
+            break;
+        }
     }
 
-    if (http_request(client, "GET", endpoint, NULL, &status_code, &response, error) != 0) {
-        return -1;
+    if (bytes_read != NULL) {
+        *bytes_read = total_read;
     }
-
-    if (status_code != 200) {
-        set_error(error, EIO, "Read request returned a non-200 status");
-        goto out;
-    }
-
-    if (parse_ok_response(response, error, tokens, &token_count) != 0) {
-        goto out;
-    }
-
-    data_index = find_object_value(response, tokens, token_count, 0, "data_hex");
-    bytes_read_index = find_object_value(response, tokens, token_count, 0, "bytes_read");
-    if (data_index < 0 || bytes_read_index < 0) {
-        set_error(error, EIO, "Read response is missing required fields");
-        goto out;
-    }
-
-    if (token_to_string(response, &tokens[data_index], data_hex, sizeof(data_hex)) != 0 ||
-        token_to_long(response, &tokens[bytes_read_index], &server_bytes_read) != 0) {
-        set_error(error, EIO, "Failed to parse read response");
-        goto out;
-    }
-
-    if (hex_decode(data_hex, buffer, size, &decoded_len) != 0 || decoded_len != (size_t) server_bytes_read) {
-        set_error(error, EIO, "Failed to decode read data from hex");
-        goto out;
-    }
-
-    *bytes_read = decoded_len;
     result = 0;
 
 out:
@@ -585,66 +763,88 @@ out:
 
 int httpfs_write_file(httpfs_client *client, const char *path, off_t offset, const unsigned char *buffer, size_t size,
                       size_t *bytes_written, httpfs_error *error) {
-    char escaped_path[HTTPFS_MAX_PATH * 2];
-    char *data_hex = NULL;
-    char *body = NULL;
+    char endpoint[1024];
     char *response = NULL;
     long status_code = 0;
     jsmntok_t tokens[256];
     int token_count;
     int bytes_written_index;
+    int content_md5_index;
     long server_bytes_written = 0;
-    size_t body_size;
+    size_t total_written = 0;
     int result = -1;
 
-    data_hex = malloc(size * 2 + 1);
-    if (data_hex == NULL) {
-        set_error(error, ENOMEM, "Failed to allocate write buffer");
-        return -1;
+    if (bytes_written != NULL) {
+        *bytes_written = 0;
+    }
+    if (size == 0U) {
+        return 0;
     }
 
-    if (json_escape_string(path, escaped_path, sizeof(escaped_path)) != 0 ||
-        hex_encode(buffer, size, data_hex, size * 2 + 1) != 0) {
-        set_error(error, EINVAL, "Failed to build write request");
-        goto out;
+    while (total_written < size) {
+        char expected_md5[33];
+        char response_md5[33];
+        size_t chunk_size = size - total_written;
+        if (chunk_size > HTTPFS_WRITE_CHUNK_SIZE) {
+            chunk_size = HTTPFS_WRITE_CHUNK_SIZE;
+        }
+
+        free(response);
+        response = NULL;
+        if (build_write_endpoint(path, offset + (off_t) total_written, endpoint, sizeof(endpoint)) != 0) {
+            set_error(error, ENAMETOOLONG, "Failed to build write request");
+            goto out;
+        }
+        if (httpfs_sparse_md5_hex(buffer + total_written, chunk_size, offset + (off_t) total_written, expected_md5) != 0) {
+            set_error(error, EIO, "Failed to compute write content MD5");
+            goto out;
+        }
+
+        if (http_request(client, "POST", endpoint, buffer + total_written, chunk_size, "application/octet-stream", expected_md5,
+                         &status_code, &response, error) != 0) {
+            goto out;
+        }
+
+        if (status_code != 200) {
+            set_error(error, EIO, "Write request returned a non-200 status");
+            goto out;
+        }
+
+        if (parse_ok_response(response, error, tokens, &token_count) != 0) {
+            goto out;
+        }
+
+        bytes_written_index = find_object_value(response, tokens, token_count, 0, "bytes_written");
+        content_md5_index = find_object_value(response, tokens, token_count, 0, "content_md5");
+        if (bytes_written_index < 0 || token_to_long(response, &tokens[bytes_written_index], &server_bytes_written) != 0) {
+            set_error(error, EIO, "Write response is missing bytes_written");
+            goto out;
+        }
+        if (content_md5_index < 0 || token_to_string(response, &tokens[content_md5_index], response_md5, sizeof(response_md5)) !=
+                                        0 ||
+            !httpfs_is_valid_md5_hex(response_md5)) {
+            set_error(error, EIO, "Write response is missing a valid content MD5");
+            goto out;
+        }
+        if (server_bytes_written < 0 || (size_t) server_bytes_written != chunk_size) {
+            set_error(error, EIO, "Write response returned an invalid bytes_written value");
+            goto out;
+        }
+        if (strcmp(expected_md5, response_md5) != 0) {
+            set_error(error, EIO, "Write content MD5 verification failed");
+            goto out;
+        }
+
+        total_written += (size_t) server_bytes_written;
     }
 
-    body_size = strlen(escaped_path) + strlen(data_hex) + 128;
-    body = malloc(body_size);
-    if (body == NULL) {
-        set_error(error, ENOMEM, "Failed to allocate request body");
-        goto out;
+    if (bytes_written != NULL) {
+        *bytes_written = total_written;
     }
-
-    snprintf(body, body_size, "{\"path\":\"%s\",\"offset\":%lld,\"data_hex\":\"%s\"}", escaped_path, (long long) offset,
-             data_hex);
-
-    if (http_request(client, "POST", "/v1/write", body, &status_code, &response, error) != 0) {
-        goto out;
-    }
-
-    if (status_code != 200) {
-        set_error(error, EIO, "Write request returned a non-200 status");
-        goto out;
-    }
-
-    if (parse_ok_response(response, error, tokens, &token_count) != 0) {
-        goto out;
-    }
-
-    bytes_written_index = find_object_value(response, tokens, token_count, 0, "bytes_written");
-    if (bytes_written_index < 0 || token_to_long(response, &tokens[bytes_written_index], &server_bytes_written) != 0) {
-        set_error(error, EIO, "Write response is missing bytes_written");
-        goto out;
-    }
-
-    *bytes_written = (size_t) server_bytes_written;
     result = 0;
 
 out:
     free(response);
-    free(body);
-    free(data_hex);
     return result;
 }
 
@@ -669,7 +869,8 @@ static int post_path_only(httpfs_client *client, const char *endpoint, const cha
         snprintf(body, sizeof(body), "{\"path\":\"%s\"}", escaped_path);
     }
 
-    if (http_request(client, "POST", endpoint, body, &status_code, &response, error) != 0) {
+    if (http_request(client, "POST", endpoint, body, strlen(body), "application/json; charset=utf-8", NULL, &status_code,
+                     &response, error) != 0) {
         return -1;
     }
 
@@ -723,7 +924,8 @@ int httpfs_rename_path(httpfs_client *client, const char *old_path, const char *
 
     snprintf(body, sizeof(body), "{\"old_path\":\"%s\",\"new_path\":\"%s\"}", escaped_old, escaped_new);
 
-    if (http_request(client, "POST", "/v1/rename", body, &status_code, &response, error) != 0) {
+    if (http_request(client, "POST", "/v1/rename", body, strlen(body), "application/json; charset=utf-8", NULL, &status_code,
+                     &response, error) != 0) {
         return -1;
     }
 
@@ -759,7 +961,8 @@ int httpfs_truncate_file(httpfs_client *client, const char *path, off_t size, ht
 
     snprintf(body, sizeof(body), "{\"path\":\"%s\",\"size\":%lld}", escaped_path, (long long) size);
 
-    if (http_request(client, "POST", "/v1/truncate", body, &status_code, &response, error) != 0) {
+    if (http_request(client, "POST", "/v1/truncate", body, strlen(body), "application/json; charset=utf-8", NULL, &status_code,
+                     &response, error) != 0) {
         return -1;
     }
 
@@ -802,7 +1005,8 @@ int httpfs_update_times(httpfs_client *client, const char *path, const struct ti
              "{\"path\":\"%s\",\"atime_sec\":%lld,\"atime_nsec\":%ld,\"mtime_sec\":%lld,\"mtime_nsec\":%ld}",
              escaped_path, (long long) times[0].tv_sec, times[0].tv_nsec, (long long) times[1].tv_sec, times[1].tv_nsec);
 
-    if (http_request(client, "POST", "/v1/utimens", body, &status_code, &response, error) != 0) {
+    if (http_request(client, "POST", "/v1/utimens", body, strlen(body), "application/json; charset=utf-8", NULL, &status_code,
+                     &response, error) != 0) {
         return -1;
     }
 
